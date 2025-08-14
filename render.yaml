@@ -9,7 +9,9 @@ services:
       - key: PYTHONUNBUFFERED
         value: "1"
       - key: ATTR_XLSX
-        value: "data/arquivo_completo_brasil.xlsx"
-      # opcional: se quiser forçar refresh manual via /refresh?token=...
+        value: "arquivo_completo_brasil.xlsx"   # <- estava data/arquivo...
+      # (opcional) só se você for subir um geojson na RAIZ:
+      # - key: GEOJSON_PATH
+      #   value: "municipios_br.geojson"
       - key: REFRESH_TOKEN
         generateValue: true
