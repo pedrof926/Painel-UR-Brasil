@@ -1,6 +1,7 @@
 # Painel de Umidade Relativa – Brasil (UR mínima, 5 dias)
 
-import os, json
+
+import os, json, time
 import pandas as pd
 import numpy as np
 from datetime import datetime, timedelta
@@ -9,6 +10,8 @@ import plotly.express as px
 import plotly.graph_objects as go
 import pytz
 from flask import request, jsonify
+import requests
+from concurrent.futures import ThreadPoolExecutor, as_completed
 
 # ================== CONFIG ==================
 APP_TITLE   = "Umidade Relativa do Ar – Brasil (UR mínima)"
@@ -16,8 +19,20 @@ BRT         = pytz.timezone("America/Sao_Paulo")
 
 # Tudo na RAIZ do repo
 ATTR_XLSX    = os.environ.get("ATTR_XLSX", "arquivo_completo_brasil.xlsx")   # municípios (lat/lon)
-GEOJSON_PATH = os.environ.get("GEOJSON_PATH", "municipios_br.geojson")       # <-- agora usando o geojson
+GEOJSON_PATH = os.environ.get("GEOJSON_PATH", "municipios_br.geojson")       # geojson de municípios (opcional)
 REFRESH_TOKEN= os.environ.get("REFRESH_TOKEN", "")                           # opcional /refresh?token=...
+# Para testes no plano free (primeiro deploy) você pode limitar a quantidade processada:
+MAX_MUN      = int(os.environ.get("MAX_MUN", "0"))  # 0 = todos; ex: 200 para testar mais rápido
+
+# API do INMET (previsão por município IBGE)
+# Em geral o endpoint é: https://apiprevmet3.inmet.gov.br/previsao/{CD_MUN}
+INMET_FORECAST_URL = os.environ.get(
+    "INMET_FORECAST_URL_TEMPLATE",
+    "https://apiprevmet3.inmet.gov.br/previsao/{ibge}"
+)
+
+REQUEST_TIMEOUT = float(os.environ.get("REQUEST_TIMEOUT", "8"))  # segundos
+MAX_WORKERS     = int(os.environ.get("MAX_WORKERS", "16"))       # threads
 
 # ================== CLASSES/CORES ==================
 COLOR_MAP = {
@@ -48,25 +63,21 @@ def classificar_rhmin(v):
     if 0  <= v < 12:      return "Emergência (<12%)"
     return np.nan
 
-# ================== GEOJSON (robusto) ==================
+# ================== GEOJSON ==================
 def _guess_cd_mun(props: dict) -> str | None:
-    # tenta chaves usuais
     for k in ["CD_MUN","CD_GEOCMU","CD_GEOCODI","CD_MUNIC","CD_IBGE","GEOCODIGO","GEOCODE","GEOCOD_M","codigo_ibge"]:
         if k in props and pd.notna(props[k]):
-            s = str(props[k])
-            dig = "".join(ch for ch in s if ch.isdigit())
+            s = str(props[k]); dig = "".join(ch for ch in s if ch.isdigit())
             if 6 <= len(dig) <= 7:
                 return dig.zfill(7)
-    # fallback: procura qualquer campo com 6–7 dígitos
     for v in props.values():
-        s = str(v)
-        dig = "".join(ch for ch in s if ch.isdigit())
+        s = str(v); dig = "".join(ch for ch in s if ch.isdigit())
         if 6 <= len(dig) <= 7:
             return dig.zfill(7)
     return None
 
 def load_geojson(path):
-    if not path or not os.path.exists(path): 
+    if not path or not os.path.exists(path):
         print("[geo] GeoJSON não encontrado, usando fallback por pontos (lat/lon).")
         return None
     try:
@@ -75,11 +86,7 @@ def load_geojson(path):
         for ft in gj.get("features", []):
             props = ft.setdefault("properties", {})
             cd = _guess_cd_mun(props)
-            if cd:
-                props["CD_MUN"] = cd
-            else:
-                # garante a chave, mesmo se não achou
-                props["CD_MUN"] = str(props.get("CD_MUN","")).zfill(7)
+            props["CD_MUN"] = cd or str(props.get("CD_MUN","")).zfill(7)
         return gj
     except Exception as e:
         print("[geo] Falha ao ler GeoJSON:", e)
@@ -87,10 +94,7 @@ def load_geojson(path):
 
 gj = load_geojson(GEOJSON_PATH)
 
-# ================== PIPELINE INMET (cole aqui o seu ETL) ==================
-def z7(s):  # zfill(7) robusto
-    return pd.Series([s], dtype=str).str.extract(r"(\d+)")[0].iloc[0].zfill(7)
-
+# ================== PIPELINE INMET ==================
 def load_attr_municipios(path: str) -> pd.DataFrame:
     if not os.path.exists(path):
         raise SystemExit(f"❌ Não encontrei o arquivo de municípios: {path}")
@@ -108,17 +112,107 @@ def load_attr_municipios(path: str) -> pd.DataFrame:
     out = out.dropna(subset=["lat","lon"]).drop_duplicates("CD_MUN")
     return out[["CD_MUN","NM_MUN","SIGLA_UF","lat","lon"]]
 
+def _parse_inmet_resp(ibge: str, j: dict) -> dict:
+    """
+    Tenta interpretar respostas do INMET para previsão diária com umidade.
+    Padrões conhecidos:
+      - { "<ibge>": { "YYYY-MM-DD": {"umidade_min": 28, ...}, ... } }
+      - { "YYYY-MM-DD": {"umidade_min": 28, ...}, ... }
+    Aceita variações de chave: umidade_min | ur_min | umi_min
+    Retorna: {date -> rhmin(float)}
+    """
+    def _get_min(d):
+        for k in ["umidade_min","ur_min","umi_min","umidadeMin","UR_min"]:
+            if isinstance(d, dict) and k in d:
+                try:
+                    return float(d[k])
+                except Exception:
+                    pass
+        # fallback: se vier lista de horários com "umidade", pega o mínimo
+        if isinstance(d, dict):
+            for v in d.values():
+                if isinstance(v, (list, tuple)) and v and isinstance(v[0], (int, float, str)):
+                    try:
+                        vals = pd.to_numeric(pd.Series(v), errors="coerce")
+                        if vals.notna().any():
+                            return float(np.nanmin(vals))
+                    except Exception:
+                        pass
+        return np.nan
+
+    # Se vier com a chave do IBGE no topo
+    if isinstance(j, dict) and ibge in j and isinstance(j[ibge], dict):
+        j = j[ibge]
+
+    out = {}
+    if isinstance(j, dict):
+        for k, v in j.items():
+            # k pode ser a data
+            try:
+                d = pd.to_datetime(k).date()
+            except Exception:
+                continue
+            out[d] = _get_min(v)
+    return out
+
+def _fetch_one(ibge: str) -> dict:
+    url = INMET_FORECAST_URL.format(ibge=ibge)
+    r = requests.get(url, timeout=REQUEST_TIMEOUT)
+    if r.status_code != 200:
+        return {}
+    try:
+        j = r.json()
+    except Exception:
+        return {}
+    return _parse_inmet_resp(ibge, j)
+
 def build_df(attr_xlsx_path: str) -> pd.DataFrame:
     """
-    >>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>
-    TODO INMET: COLE AQUI seu pipeline que hoje gera a previsão (5 dias) e RETORNE um
-    DataFrame com colunas:
-      CD_MUN (str, 7 dígitos), NM_MUN, SIGLA_UF, lat, lon, data (date), RHmin (float), RHmax (opcional)
-    Dica: onde você fazia df.to_excel(...), troque por: return df
-    Se seu ETL precisar do XLSX de municípios, use load_attr_municipios(attr_xlsx_path).
-    >>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>
+    Coleta previsão do INMET sem XLSX intermediário e retorna:
+    [CD_MUN, NM_MUN, SIGLA_UF, lat, lon, data, RHmin]
+    - Usa INMET_FORECAST_URL (por IBGE)
+    - Limita a 5 dias a partir de hoje
     """
-    raise NotImplementedError("Cole o seu pipeline do INMET dentro de build_df(...).")
+    attr = load_attr_municipios(attr_xlsx_path)
+    if MAX_MUN > 0:
+        attr = attr.head(MAX_MUN).copy()  # útil para o primeiro deploy no plano free
+
+    today = datetime.now(BRT).date()
+    target_days = [today + timedelta(days=i) for i in range(5)]
+    rows = []
+
+    # paraleliza para acelerar, com limites razoáveis
+    with ThreadPoolExecutor(max_workers=MAX_WORKERS) as ex:
+        futures = {ex.submit(_fetch_one, ibge): (ibge, row)
+                   for ibge, row in zip(attr["CD_MUN"], attr.to_dict("records"))}
+        for fut in as_completed(futures):
+            ibge, row = futures[fut]
+            try:
+                day_map = fut.result()  # {date -> rhmin}
+            except Exception:
+                day_map = {}
+            for d in target_days:
+                rh = day_map.get(d, np.nan)
+                rows.append({
+                    "CD_MUN": row["CD_MUN"],
+                    "NM_MUN": row["NM_MUN"],
+                    "SIGLA_UF": row["SIGLA_UF"],
+                    "lat": row["lat"],
+                    "lon": row["lon"],
+                    "data": d,
+                    "RHmin": rh,
+                    "RHmax": np.nan
+                })
+            # pequena pausa de gentileza a cada ~200 requisições concluídas
+            if len(rows) % 1000 == 0:
+                time.sleep(0.2)
+
+    df = pd.DataFrame(rows)
+    # Se por algum motivo não retornou nada (API fora), evitamos quebrar o app
+    if df["RHmin"].notna().sum() == 0:
+        # marca NaN, o app continua de pé (e você pode forçar /refresh quando a API voltar)
+        print("[inmet] Aviso: sem dados de umidade na resposta. Mantendo NaN (app não cai).")
+    return df
 
 # ================== CACHE DIÁRIO (BRT) ==================
 _CACHE = {"key": None, "df": None}
@@ -161,8 +255,8 @@ def get_data(force=False) -> pd.DataFrame:
     print(f"[umidade] (re)montando dados – chave diária {key}")
     try:
         df = build_df(ATTR_XLSX)
-    except NotImplementedError as e:
-        print(">>> AVISO:", e)
+    except Exception as e:
+        print(">>> AVISO: falha no pipeline do INMET, usando dados demo. Erro:", e)
         df = _demo_df()
     df = _sanitize_df(df)
     _CACHE.update(key=key, df=df)
@@ -311,8 +405,7 @@ def update_map(ufs_sel, muni_sel, date_idx):
             hover_data={"NM_MUN": True, "SIGLA_UF": True, "RHmin":":.0f"},
             center={"lat": -14.2, "lon": -51.9}, zoom=3.5
         )
-        # sem bordas para não “poluir”
-        fig.update_traces(marker_line_width=0)
+        fig.update_traces(marker_line_width=0)  # sem bordas
         fig.update_layout(
             mapbox_style="carto-positron",
             margin=dict(l=0,r=0,t=0,b=0),
@@ -416,5 +509,6 @@ def list_by_class(sel_class, ufs_sel, muni_sel, date_idx):
 
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 8060)), debug=False)
+
 
 
