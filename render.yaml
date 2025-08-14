@@ -1,0 +1,15 @@
+services:
+  - type: web
+    name: umidade-br
+    env: python
+    plan: free
+    buildCommand: pip install -r requirements.txt
+    startCommand: gunicorn -k gthread -w 2 -t 120 -b 0.0.0.0:$PORT app:server
+    envVars:
+      - key: PYTHONUNBUFFERED
+        value: "1"
+      - key: ATTR_XLSX
+        value: "data/arquivo_completo_brasil.xlsx"
+      # opcional: se quiser forçar refresh manual via /refresh?token=...
+      - key: REFRESH_TOKEN
+        generateValue: true
