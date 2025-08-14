@@ -1,7 +1,4 @@
-# app.py
 # Painel de Umidade Relativa – Brasil (UR mínima, 5 dias)
-# ✔ Único arquivo: pipeline INMET + cache diário (BRT) + Dash
-# ✔ Sem XLSX intermediário (apenas lê o XLSX de municípios)
 
 import os, json
 import pandas as pd
@@ -14,13 +11,13 @@ import pytz
 from flask import request, jsonify
 
 # ================== CONFIG ==================
-APP_TITLE   = "Umidade Relativa do Ar – Brasil (UR mínima, 5 dias)"
+APP_TITLE   = "Umidade Relativa do Ar – Brasil (UR mínima)"
 BRT         = pytz.timezone("America/Sao_Paulo")
 
-# Caminhos dentro do repo
-ATTR_XLSX    = os.environ.get("ATTR_XLSX", "data/arquivo_completo_brasil.xlsx")  # municípios (CD_MUN,NM_MUN,SIGLA_UF,lat,lon)
-GEOJSON_PATH = os.environ.get("GEOJSON_PATH", "geo/municipios_br.geojson")       # opcional; se ausente, cai p/ pontos
-REFRESH_TOKEN= os.environ.get("REFRESH_TOKEN", "")                                # opcional para /refresh?token=...
+# Tudo na RAIZ do repo
+ATTR_XLSX    = os.environ.get("ATTR_XLSX", "arquivo_completo_brasil.xlsx")   # municípios (lat/lon)
+GEOJSON_PATH = os.environ.get("GEOJSON_PATH", "municipios_br.geojson")       # <-- agora usando o geojson
+REFRESH_TOKEN= os.environ.get("REFRESH_TOKEN", "")                           # opcional /refresh?token=...
 
 # ================== CLASSES/CORES ==================
 COLOR_MAP = {
@@ -51,15 +48,38 @@ def classificar_rhmin(v):
     if 0  <= v < 12:      return "Emergência (<12%)"
     return np.nan
 
-# ================== GEOJSON (opcional) ==================
+# ================== GEOJSON (robusto) ==================
+def _guess_cd_mun(props: dict) -> str | None:
+    # tenta chaves usuais
+    for k in ["CD_MUN","CD_GEOCMU","CD_GEOCODI","CD_MUNIC","CD_IBGE","GEOCODIGO","GEOCODE","GEOCOD_M","codigo_ibge"]:
+        if k in props and pd.notna(props[k]):
+            s = str(props[k])
+            dig = "".join(ch for ch in s if ch.isdigit())
+            if 6 <= len(dig) <= 7:
+                return dig.zfill(7)
+    # fallback: procura qualquer campo com 6–7 dígitos
+    for v in props.values():
+        s = str(v)
+        dig = "".join(ch for ch in s if ch.isdigit())
+        if 6 <= len(dig) <= 7:
+            return dig.zfill(7)
+    return None
+
 def load_geojson(path):
-    if not path or not os.path.exists(path): return None
+    if not path or not os.path.exists(path): 
+        print("[geo] GeoJSON não encontrado, usando fallback por pontos (lat/lon).")
+        return None
     try:
         with open(path, "r", encoding="utf-8") as f:
             gj = json.load(f)
         for ft in gj.get("features", []):
             props = ft.setdefault("properties", {})
-            props["CD_MUN"] = str(props.get("CD_MUN","")).zfill(7)
+            cd = _guess_cd_mun(props)
+            if cd:
+                props["CD_MUN"] = cd
+            else:
+                # garante a chave, mesmo se não achou
+                props["CD_MUN"] = str(props.get("CD_MUN","")).zfill(7)
         return gj
     except Exception as e:
         print("[geo] Falha ao ler GeoJSON:", e)
@@ -75,7 +95,6 @@ def load_attr_municipios(path: str) -> pd.DataFrame:
     if not os.path.exists(path):
         raise SystemExit(f"❌ Não encontrei o arquivo de municípios: {path}")
     attr = pd.read_excel(path, engine="openpyxl")
-    # tenta mapear nomes de coluna comuns
     cols_low = {c.lower(): c for c in attr.columns}
     cd = cols_low.get("cd_mun") or cols_low.get("cd_ibge") or "CD_MUN"
     nm = cols_low.get("nm_mun") or "NM_MUN"
@@ -96,12 +115,9 @@ def build_df(attr_xlsx_path: str) -> pd.DataFrame:
     DataFrame com colunas:
       CD_MUN (str, 7 dígitos), NM_MUN, SIGLA_UF, lat, lon, data (date), RHmin (float), RHmax (opcional)
     Dica: onde você fazia df.to_excel(...), troque por: return df
+    Se seu ETL precisar do XLSX de municípios, use load_attr_municipios(attr_xlsx_path).
     >>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>
     """
-    # Exemplo de estrutura esperada (REMOVA após colar seu pipeline):
-    # base = load_attr_municipios(attr_xlsx_path)
-    # df_final = seu_etl_inmet(base)  # deve devolver colunas acima
-    # return df_final
     raise NotImplementedError("Cole o seu pipeline do INMET dentro de build_df(...).")
 
 # ================== CACHE DIÁRIO (BRT) ==================
@@ -122,7 +138,6 @@ def _sanitize_df(df: pd.DataFrame) -> pd.DataFrame:
     return df.sort_values(["CD_MUN","data"]).reset_index(drop=True)
 
 def _demo_df() -> pd.DataFrame:
-    # dados de demonstração (3 capitais × 5 dias) para validar a UI
     base = pd.DataFrame({
         "CD_MUN": ["5300108","3550308","3304557"],
         "NM_MUN": ["Brasília","São Paulo","Rio de Janeiro"],
@@ -132,15 +147,15 @@ def _demo_df() -> pd.DataFrame:
     })
     today = datetime.now(BRT).date()
     rows=[]
+    vals = [55, 35, 18, 62, 28]
     for _, r in base.iterrows():
         for i in range(5):
             d = today + timedelta(days=i)
-            rhmin = [55, 35, 18, 62, 28][i % 5]  # valores só p/ demonstrar as classes
-            rows.append({**r.to_dict(), "data": d, "RHmin": rhmin, "RHmax": np.nan})
+            rows.append({**r.to_dict(), "data": d, "RHmin": vals[i % 5], "RHmax": np.nan})
     return pd.DataFrame(rows)
 
 def get_data(force=False) -> pd.DataFrame:
-    key = datetime.now(BRT).strftime("%Y-%m-%d")  # muda a cada virada de dia no Brasil
+    key = datetime.now(BRT).strftime("%Y-%m-%d")
     if (not force) and _CACHE["key"] == key and _CACHE["df"] is not None:
         return _CACHE["df"]
     print(f"[umidade] (re)montando dados – chave diária {key}")
@@ -158,7 +173,6 @@ app = Dash(__name__)
 server = app.server
 app.title = APP_TITLE
 
-# endpoint opcional de refresh manual
 @server.route("/refresh", methods=["GET","POST"])
 def refresh_endpoint():
     if REFRESH_TOKEN:
@@ -171,7 +185,6 @@ def refresh_endpoint():
     except Exception as e:
         return jsonify({"ok": False, "error": str(e)}), 500
 
-# dados iniciais
 umid = get_data()
 ufs  = sorted(umid["SIGLA_UF"].dropna().unique().tolist())
 
@@ -242,7 +255,6 @@ app.layout = html.Div([
 ], style={"fontFamily":"Inter, system-ui, Arial", "padding":"12px"})
 
 # ================== CALLBACKS ==================
-# Municípios dependentes do(s) UF(s)
 @app.callback(
     Output("muni-filter", "options"),
     Output("muni-filter", "value"),
@@ -257,7 +269,6 @@ def update_muni_dropdown(ufs_sel):
     options = [{"label": f"{r.NM_MUN} / {r.SIGLA_UF}", "value": r.CD_MUN} for r in muni.itertuples()]
     return options, None
 
-# Seleção global (clique no mapa OU dropdown)
 @app.callback(
     Output("muni-sel","data"),
     Input("mapa","clickData"),
@@ -272,7 +283,6 @@ def set_selection(clickData, dropdown_val, sel):
         if cd: return cd
     return sel
 
-# Mapa por classe (UR mínima no dia)
 @app.callback(
     Output("mapa","figure"),
     Input("uf-filter","value"),
@@ -301,7 +311,8 @@ def update_map(ufs_sel, muni_sel, date_idx):
             hover_data={"NM_MUN": True, "SIGLA_UF": True, "RHmin":":.0f"},
             center={"lat": -14.2, "lon": -51.9}, zoom=3.5
         )
-        fig.update_traces(marker_line_width=0)  # sem linhas de município
+        # sem bordas para não “poluir”
+        fig.update_traces(marker_line_width=0)
         fig.update_layout(
             mapbox_style="carto-positron",
             margin=dict(l=0,r=0,t=0,b=0),
@@ -321,7 +332,6 @@ def update_map(ufs_sel, muni_sel, date_idx):
                           legend_title_text="Classificação (UR mínima)")
     return fig
 
-# Gráfico 5 dias + cards (pela seleção global)
 @app.callback(
     Output("grafico","figure"),
     Output("cards-ur","children"),
@@ -367,7 +377,6 @@ def update_chart(sel_cd):
         )
     return fig_bar, cards
 
-# Lista por classificação (no dia)
 @app.callback(
     Output("class-count","children"),
     Output("class-list","children"),
@@ -407,4 +416,5 @@ def list_by_class(sel_class, ufs_sel, muni_sel, date_idx):
 
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 8060)), debug=False)
+
 
